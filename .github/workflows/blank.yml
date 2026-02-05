@@ -1,4 +1,4 @@
-name: FastAPI Deployment Pipeline (Private EC2 via SSM)
+name: FastAPI-Deployment-Pipeline
 
 on:
   push:
@@ -12,54 +12,61 @@ permissions:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # --- [CD 영역 시작: 도커 이미지 생성] ---
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: "${{ secrets.DOCKER_USERNAME }}"
-          password: "${{ secrets.DOCKER_ACCESS_TOKEN }}"
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          # FastAPI 용 이미지 태그로 변경
-          tags: "${{ secrets.DOCKER_USERNAME }}/fastapi-app:latest"
-
-      # --- [CD 영역: AWS 자격 증명 설정] ---
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: "${{ secrets.AWS_ACCESS_KEY }}"
-          aws-secret-access-key: "${{ secrets.AWS_SECRET_KEY }}"
-          aws-region: "${{ secrets.AWS_REGION }}"
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      # --- [CD 영역: SSM을 통한 EC2 실 배포] ---
-      - name: Deploy to EC2 via SSM
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image to ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.AWS_ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
         run: |
+          FULL_IMAGE_NAME="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+          
+          docker build -t "${FULL_IMAGE_NAME}:${IMAGE_TAG}" .
+          docker build -t "${FULL_IMAGE_NAME}:latest" .
+          
+          docker push "${FULL_IMAGE_NAME}:${IMAGE_TAG}"
+          docker push "${FULL_IMAGE_NAME}:latest"
+
+      - name: Deploy to ASG via SSM
+        run: |
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          REPO="${{ secrets.AWS_ECR_REPOSITORY }}"
+          TAG="${{ github.sha }}"
+          FULL_IMAGE="$REGISTRY/$REPO:$TAG"
+
           aws ssm send-command \
-            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --targets "Key=tag:aws:autoscaling:groupName,Values=${{ secrets.ASG_NAME }}" \
             --document-name "AWS-RunShellScript" \
-            --comment "Deploying FastAPI via SSM" \
-            --parameters 'commands=[
-              "sudo docker login -u ${{ secrets.DOCKER_USERNAME }} -p ${{ secrets.DOCKER_ACCESS_TOKEN }}",
-              
-              "# 1. 최신 이미지 가져오기",
-              "sudo docker pull ${{ secrets.DOCKER_USERNAME }}/fastapi-app:latest",
-
-              "# 2. 기존 컨테이너 중지 및 삭제",
-              "sudo docker stop fastapi-server || true",
-              "sudo docker rm fastapi-server || true",
-
-              "# 3. 8000번 포트로 실행",
-              "sudo docker run -d --name fastapi-server -p 8000:8000 ${{ secrets.DOCKER_USERNAME }}/fastapi-app:latest",
-
-              "# 4. 오래된 이미지 정리",
-              "sudo docker image prune -f"
-            ]' \
-            --region ${{ secrets.AWS_REGION }}
+            --comment "Deploying FastAPI to ASG via GitHub Actions" \
+            --region ${{ secrets.AWS_REGION }} \
+            --parameters "{
+              \"commands\": [
+                \"# ECR 로그인\",
+                \"aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | sudo docker login --username AWS --password-stdin $REGISTRY\",
+                
+                \"# 최신 이미지 가져오기 및 실행\",
+                \"sudo docker pull $FULL_IMAGE\",
+                \"sudo docker stop fastapi-server || true\",
+                \"sudo docker rm fastapi-server || true\",
+                
+                \"sudo docker run -d --name fastapi-server -p 8000:8000 $FULL_IMAGE\",
+                
+                \"# 리소스 정리\",
+                \"sudo docker image prune -f\"
+              ]
+            }"
